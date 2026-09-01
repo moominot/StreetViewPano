@@ -1,0 +1,11 @@
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# Configuració local de l'app (carpeta de sortida desada per l'usuari)
+.panoStreetView_config.json
