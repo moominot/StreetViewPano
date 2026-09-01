@@ -237,7 +237,7 @@ class PanoApp(tk.Tk):
         entry_adr.focus_set()
         ttk.Label(
             frm_adr,
-            text="p. ex. «Carrer Lluna 14, Pòrtol», «39.6511, 2.7241» o "
+            text="p. ex. «Carrer Llunatics 54, Purtal», «59.6511, 5.7241» o "
                  "«https://maps.app.goo.gl/...»",
             foreground="#777",
         ).pack(anchor="w", padx=8, pady=(2, 8))
