@@ -27,8 +27,8 @@ python panoStreetViewGUI.py
 
 Al camp principal, introdueix qualsevol d'aquestes tres opcions:
 
-- Una adreça: `Carrer Lluna 14, Pòrtol`
-- Unes coordenades: `39.6511, 2.7241`
+- Una adreça: `Carrer Eclipsi 12, Porto`
+- Unes coordenades: `49.6511, 5.9241`
 - Un enllaç de Google Maps: `https://maps.app.goo.gl/...`
 
 Prem **"Cercar i previsualitzar"**. Si el punt és el correcte, prem **"Descarrega resolució desitjada"** per baixar-ne la resolució definitiva. Un cop descarregat, mou els lliscadors de la secció inferior per extreure'n vistes planes i desa-les amb **"Desa vista com a..."**.
