@@ -37,7 +37,7 @@ STREETVIEW_HEADERS = {
 }
 
 ZOOM_INFO = {
-    0: "512×512 (mínima)",
+    0: "512×256 (mínima)",
     1: "1024×512",
     2: "2048×1024",
     3: "4096×2048",
@@ -142,6 +142,15 @@ def descarrega_panorama(pano_id, zoom, progress_cb=None):
             fet += 1
             if progress_cb:
                 progress_cb(fet, total)
+
+    # Al zoom 0 el servidor només retorna una única tessel·la de 512×512,
+    # però el contingut real del panorama (relació 2:1 equirectangular) només
+    # n'ocupa la meitat superior — la resta és farciment negre de Google.
+    # Ho retallem aquí per a qualsevol zoom, com a mesura de seguretat general.
+    amplada, alcada = panorama.size
+    alcada_correcta = amplada // 2
+    if alcada > alcada_correcta:
+        panorama = panorama.crop((0, 0, amplada, alcada_correcta))
 
     return panorama
 
@@ -319,9 +328,6 @@ class PanoApp(tk.Tk):
 
         frm_btn_vista = ttk.Frame(frm_vista)
         frm_btn_vista.grid(row=6, column=0, columnspan=2, pady=8, sticky="ew")
-        self.btn_extreu = ttk.Button(frm_btn_vista, text="Actualitza vista",
-                                      command=lambda: self._extreu_vista(auto=False), state="disabled")
-        self.btn_extreu.pack(fill="x", pady=(0, 4))
         self.btn_desa_vista = ttk.Button(frm_btn_vista, text="Desa vista com a...",
                                           command=self._desa_vista, state="disabled")
         self.btn_desa_vista.pack(fill="x")
@@ -416,9 +422,10 @@ class PanoApp(tk.Tk):
         self.panorama_complet = img
         # Deduïm un panoid "fictici" a partir del nom de fitxer, només per als noms de sortida
         self.pano_id = os.path.splitext(os.path.basename(ruta))[0]
+        self._resolucio_definitiva = True  # imatge pròpia: la tractem com a "definitiva", sense baixar res més
         self._mostra_preview(img, f"carregada des de {os.path.basename(ruta)}")
         self._log(f"Imatge carregada: {os.path.basename(ruta)} ({img.width}×{img.height})")
-        self.btn_extreu.config(state="normal")
+        self._extreu_vista(auto=True)
 
     def _iniciar_descarrega(self):
         adreca = self.adreca_var.get().strip()
@@ -429,7 +436,6 @@ class PanoApp(tk.Tk):
         self._desa_config()
         self.btn_descarrega.config(state="disabled")
         self.btn_desc_definitiva.config(state="disabled")
-        self.btn_extreu.config(state="disabled")
         self.btn_desa_vista.config(state="disabled")
         self.progress.config(value=0, maximum=100)
 
@@ -555,10 +561,9 @@ class PanoApp(tk.Tk):
             self.panorama_complet = preview  # de moment, la previsualització fa de "complet"
             self._resolucio_definitiva = False
             self.after(0, lambda: self._mostra_preview(preview, "previsualització ràpida (zoom 0)"))
-            self._log("Previsualització llesta. Si és el punt correcte, prem "
-                       "«Descarrega resolució desitjada».")
+            self._log("Previsualització llesta — mostrant vista plana (baixa resolució).")
             self.after(0, lambda: self.btn_desc_definitiva.config(state="normal"))
-            self.after(0, lambda: self.btn_extreu.config(state="normal"))
+            self.after(0, lambda: self._extreu_vista(auto=True))
 
         except Exception as e:
             self._log(f"Error: {e}")
@@ -570,7 +575,6 @@ class PanoApp(tk.Tk):
         if not self.pano_id:
             return
         self.btn_desc_definitiva.config(state="disabled")
-        self.btn_extreu.config(state="disabled")
         self.btn_desa_vista.config(state="disabled")
         zoom = self.zoom_var.get()
         cols = 2 ** zoom
@@ -603,14 +607,14 @@ class PanoApp(tk.Tk):
             panorama_final.save(out_path, quality=95)
 
             self.after(0, lambda: self._mostra_preview(panorama_final, "panorama definitiu"))
-            self._log(f"Fet! Panorama desat a: {out_path}")
+            self._log(f"Fet! Panorama desat a: {out_path}. Actualitzant vista plana en alta resolució...")
+            self.after(0, lambda: self._extreu_vista(auto=True))
 
         except Exception as e:
             self._log(f"Error: {e}")
             self.after(0, lambda: messagebox.showerror("Error", str(e)))
         finally:
             self.after(0, lambda: self.btn_desc_definitiva.config(state="normal"))
-            self.after(0, lambda: self.btn_extreu.config(state="normal"))
 
     def _mostra_preview(self, panorama_img, etiqueta=""):
         self._preview_source = panorama_img
@@ -655,16 +659,6 @@ class PanoApp(tk.Tk):
         if self._extracting:
             return  # ja n'hi ha una en curs; la propera pujada de lliscador ja la reprogramarà
 
-        # En mode manual (l'usuari ha premut "Actualitza vista"), si encara no tenim
-        # la resolució definitiva descarregada, la baixem primer automàticament
-        # perquè la vista extreta surti amb la millor qualitat, no la de la
-        # previsualització ràpida (zoom 0).
-        if not auto and not self._resolucio_definitiva and self.pano_id:
-            self._log("Baixant primer la resolució definitiva per a una millor qualitat...")
-            self.btn_extreu.config(state="disabled")
-            threading.Thread(target=self._baixa_definitiva_i_extreu, daemon=True).start()
-            return
-
         heading = self.heading_var.get()
         pitch = self.pitch_var.get()
         fov = self.fov_var.get()
@@ -672,7 +666,6 @@ class PanoApp(tk.Tk):
         self._extracting = True
         if not auto:
             self._log("Extraient vista plana...")
-            self.btn_extreu.config(state="disabled")
 
         def feina():
             try:
@@ -687,46 +680,8 @@ class PanoApp(tk.Tk):
                 self._log(f"Error extraient la vista: {e}")
             finally:
                 self._extracting = False
-                if not auto:
-                    self.after(0, lambda: self.btn_extreu.config(state="normal"))
 
         threading.Thread(target=feina, daemon=True).start()
-
-    def _baixa_definitiva_i_extreu(self):
-        """Baixa la resolució definitiva (mateix codi que el botó dedicat) i,
-        un cop llesta, extreu la vista plana automàticament."""
-        try:
-            pano_id = self.pano_id
-            zoom = self.zoom_var.get()
-            cols = 2 ** zoom
-            rows = 2 ** (zoom - 1) if zoom > 0 else 1
-            self.after(0, lambda: self.progress.config(maximum=cols * rows, value=0))
-
-            if zoom > 0:
-                def progress_cb(fet, total):
-                    self.after(0, lambda: self.progress.config(value=fet))
-                    self.after(0, lambda: self.log_var.set(f"Descarregant tessel·les... {fet}/{total}"))
-
-                panorama_final = descarrega_panorama(pano_id, zoom, progress_cb)
-            else:
-                panorama_final = self.panorama_complet
-
-            self.panorama_complet = panorama_final
-            self._resolucio_definitiva = True
-            nom_fitxer = f"panorama_{pano_id}_z{zoom}.jpg"
-            out_path = os.path.join(self.carpeta_var.get(), nom_fitxer)
-            panorama_final.save(out_path, quality=95)
-            self.after(0, lambda: self._mostra_preview(panorama_final, "panorama definitiu"))
-            self._log(f"Resolució definitiva llesta ({out_path}). Extraient vista...")
-
-        except Exception as e:
-            self._log(f"Error baixant la resolució definitiva: {e}")
-            self.after(0, lambda: messagebox.showerror("Error", str(e)))
-            self.after(0, lambda: self.btn_extreu.config(state="normal"))
-            return
-
-        # Ara sí, extreu la vista amb la imatge d'alta resolució ja disponible.
-        self.after(0, lambda: self._extreu_vista(auto=False))
 
     def _mostra_vista(self, vista_img):
         self._vista_source = vista_img
@@ -750,6 +705,70 @@ class PanoApp(tk.Tk):
         self._debounce_vista_resize_id = self.after(150, self._redibuixa_vista)
 
     def _desa_vista(self):
+        if self.panorama_complet is None:
+            return
+
+        if not self._resolucio_definitiva and self.pano_id:
+            # Encara no tenim la resolució màxima: la baixem primer, tornem a
+            # extreure la vista amb aquesta qualitat, i llavors desem.
+            self._log("Baixant la resolució màxima abans de desar...")
+            self.btn_desa_vista.config(state="disabled")
+            threading.Thread(target=self._baixa_definitiva_i_desa, daemon=True).start()
+            return
+
+        self._desa_vista_al_disc()
+
+    def _baixa_definitiva_i_desa(self):
+        """Baixa la resolució definitiva, torna a extreure la vista plana amb
+        aquesta qualitat, i finalment obre el diàleg per desar-la."""
+        try:
+            pano_id = self.pano_id
+            zoom = self.zoom_var.get()
+            cols = 2 ** zoom
+            rows = 2 ** (zoom - 1) if zoom > 0 else 1
+            self.after(0, lambda: self.progress.config(maximum=cols * rows, value=0))
+
+            if zoom > 0:
+                def progress_cb(fet, total):
+                    self.after(0, lambda: self.progress.config(value=fet))
+                    self.after(0, lambda: self.log_var.set(f"Descarregant tessel·les... {fet}/{total}"))
+
+                panorama_final = descarrega_panorama(pano_id, zoom, progress_cb)
+            else:
+                panorama_final = self.panorama_complet
+
+            self.panorama_complet = panorama_final
+            self._resolucio_definitiva = True
+            nom_fitxer = f"panorama_{pano_id}_z{zoom}.jpg"
+            out_path = os.path.join(self.carpeta_var.get(), nom_fitxer)
+            panorama_final.save(out_path, quality=95)
+            self.after(0, lambda: self._mostra_preview(panorama_final, "panorama definitiu"))
+            self._log(f"Resolució definitiva llesta ({out_path}). Extraient vista en alta qualitat...")
+
+        except Exception as e:
+            self._log(f"Error baixant la resolució definitiva: {e}")
+            self.after(0, lambda: messagebox.showerror("Error", str(e)))
+            self.after(0, lambda: self.btn_desa_vista.config(state="normal"))
+            return
+
+        # Extreu la vista amb la imatge d'alta resolució ja disponible (en aquest mateix fil).
+        try:
+            heading = self.heading_var.get()
+            pitch = self.pitch_var.get()
+            fov = self.fov_var.get()
+            vista = extreu_vista_plana(self.panorama_complet, heading, pitch, fov,
+                                        out_w=1280, out_h=960)
+            self.vista_extreta = vista
+            self.after(0, lambda: self._mostra_vista(vista))
+        except Exception as e:
+            self._log(f"Error extraient la vista: {e}")
+            self.after(0, lambda: self.btn_desa_vista.config(state="normal"))
+            return
+
+        self.after(0, lambda: self.btn_desa_vista.config(state="normal"))
+        self.after(0, self._desa_vista_al_disc)
+
+    def _desa_vista_al_disc(self):
         if self.vista_extreta is None:
             return
         nom_suggerit = f"vista_{self.pano_id}_h{int(self.heading_var.get())}.jpg"
