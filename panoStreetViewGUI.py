@@ -184,7 +184,10 @@ def extreu_vista_plana(panorama_img, heading, pitch, fov, out_w=1024, out_h=768)
     theta = np.arctan2(dx3, dz3)
     phi = np.arcsin(np.clip(dy3, -1, 1))
 
-    u = ((theta / (2 * np.pi) + 0.5) * w).astype(np.int32)
+    # u=0 (vora esquerra) correspon a heading=0° al mosaic original de
+    # Street View — NO el centre. Per això aquí NO s'afegeix +0.5 (np.mod
+    # ja s'encarrega d'embolicar els valors negatius de theta cap a [0,1)).
+    u = (np.mod(theta / (2 * np.pi), 1.0) * w).astype(np.int32)
     v = ((0.5 - phi / np.pi) * h).astype(np.int32)
     u = np.clip(u, 0, w - 1)
     v = np.clip(v, 0, h - 1)
@@ -200,8 +203,8 @@ class PanoApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Street View → Panorama i vistes planes (per a Enscape)")
-        self.geometry("820x880")
-        self.minsize(760, 700)
+        self.geometry("1200x820")
+        self.minsize(880, 650)
         self.resizable(True, True)
 
         self.adreca_var = tk.StringVar()
@@ -217,8 +220,13 @@ class PanoApp(tk.Tk):
         self.preview_img = None
         self.vista_img = None
         self.vista_extreta = None      # última imatge plana extreta (PIL), per desar
+        self._preview_source = None    # imatge completa mostrada al panorama (per reescalar en redimensionar)
+        self._vista_source = None      # imatge completa mostrada a la vista plana (per reescalar en redimensionar)
         self._extracting = False
         self._debounce_id = None
+        self._debounce_preview_id = None
+        self._debounce_vista_resize_id = None
+        self._resolucio_definitiva = False  # True un cop s'ha baixat el zoom definitiu (no la previsualització)
 
         self._carrega_config()
         self._build_ui()
@@ -226,10 +234,24 @@ class PanoApp(tk.Tk):
     # -- UI -----------------------------------------------------------------
 
     def _build_ui(self):
-        pad = {"padx": 10, "pady": 6}
+        pad = {"padx": 8, "pady": 6}
+
+        # -- Partició redimensionable: columna estreta (controls) | columna ampla (imatges) --
+        self.paned = ttk.PanedWindow(self, orient="horizontal")
+        self.paned.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # Amplada mínima explícita: sense això, la columna esquerra pot quedar
+        # esquitxada a zero abans que el PanedWindow calculi les mides finals.
+        col_esquerra = ttk.Frame(self.paned, width=320)
+        col_esquerra.pack_propagate(False)
+        col_dreta = ttk.Frame(self.paned)
+        self.paned.add(col_esquerra, weight=0)
+        self.paned.add(col_dreta, weight=1)
+
+        # ===================== COLUMNA ESQUERRA: controls =====================
 
         # -- Adreça i descàrrega --
-        frm_adr = ttk.LabelFrame(self, text="Adreça, coordenades (lat,lng) o enllaç de Google Maps")
+        frm_adr = ttk.LabelFrame(col_esquerra, text="Adreça, coordenades o enllaç")
         frm_adr.pack(fill="x", **pad)
         entry_adr = ttk.Entry(frm_adr, textvariable=self.adreca_var)
         entry_adr.pack(fill="x", padx=8, pady=(8, 0))
@@ -237,83 +259,110 @@ class PanoApp(tk.Tk):
         entry_adr.focus_set()
         ttk.Label(
             frm_adr,
-            text="p. ex. «Carrer Llunatics 54, Purtal», «59.6511, 5.7241» o "
-                 "«https://maps.app.goo.gl/...»",
-            foreground="#777",
+            text="p. ex. «Carrer Lluna 14», «39.6511, 2.7241» o un enllaç de Maps",
+            foreground="#777", wraplength=280,
         ).pack(anchor="w", padx=8, pady=(2, 8))
 
-        frm_opts = ttk.Frame(self)
+        frm_opts = ttk.LabelFrame(col_esquerra, text="Opcions")
         frm_opts.pack(fill="x", **pad)
 
-        ttk.Label(frm_opts, text="Resolució definitiva (zoom):").grid(row=0, column=0, sticky="w")
+        ttk.Label(frm_opts, text="Resolució definitiva:").pack(anchor="w", padx=8, pady=(8, 0))
         zoom_combo = ttk.Combobox(
-            frm_opts, state="readonly", width=28,
+            frm_opts, state="readonly",
             values=[f"{z} — {ZOOM_INFO[z]}" for z in ZOOM_INFO],
         )
         zoom_combo.current(4)
-        zoom_combo.grid(row=0, column=1, sticky="w", padx=8)
+        zoom_combo.pack(fill="x", padx=8, pady=(2, 8))
         zoom_combo.bind("<<ComboboxSelected>>",
                          lambda e: self.zoom_var.set(int(zoom_combo.get().split(" ")[0])))
 
-        ttk.Label(frm_opts, text="Carpeta de sortida:").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(frm_opts, textvariable=self.carpeta_var, width=40).grid(
-            row=1, column=1, sticky="w", padx=8, pady=(8, 0))
-        ttk.Button(frm_opts, text="Tria...", command=self._tria_carpeta).grid(
-            row=1, column=2, padx=4, pady=(8, 0))
+        ttk.Label(frm_opts, text="Carpeta de sortida:").pack(anchor="w", padx=8)
+        frm_carpeta = ttk.Frame(frm_opts)
+        frm_carpeta.pack(fill="x", padx=8, pady=(2, 8))
+        ttk.Entry(frm_carpeta, textvariable=self.carpeta_var).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(frm_carpeta, text="Tria...", command=self._tria_carpeta).pack(
+            side="left", padx=(4, 0))
 
+        frm_botons = ttk.Frame(col_esquerra)
+        frm_botons.pack(fill="x", **pad)
         self.btn_descarrega = ttk.Button(
-            self, text="Cercar i previsualitzar", command=self._iniciar_descarrega)
-        self.btn_descarrega.pack(pady=(8, 4))
+            frm_botons, text="Cercar i previsualitzar", command=self._iniciar_descarrega)
+        self.btn_descarrega.pack(fill="x", pady=(0, 4))
 
         self.btn_desc_definitiva = ttk.Button(
-            self, text="Descarrega resolució desitjada",
+            frm_botons, text="Descarrega resolució desitjada",
             command=self._iniciar_descarrega_definitiva, state="disabled")
-        self.btn_desc_definitiva.pack(pady=(0, 8))
+        self.btn_desc_definitiva.pack(fill="x", pady=(0, 4))
 
-        self.progress = ttk.Progressbar(self, mode="determinate", length=600)
-        self.progress.pack(padx=10, pady=(0, 8))
+        self.btn_carrega_img = ttk.Button(
+            frm_botons, text="Carrega imatge de panorama...", command=self._carrega_imatge)
+        self.btn_carrega_img.pack(fill="x")
 
-        frm_preview = ttk.LabelFrame(self, text="Previsualització del panorama")
-        frm_preview.pack(fill="x", padx=10, pady=(0, 6))
-        self.lbl_preview = ttk.Label(frm_preview, text="(encara no hi ha imatge)", anchor="center")
-        self.lbl_preview.pack(fill="x", padx=8, pady=8)
+        self.progress = ttk.Progressbar(col_esquerra, mode="determinate")
+        self.progress.pack(fill="x", padx=8, pady=(8, 4))
 
-        frm_log = ttk.Frame(self)
-        frm_log.pack(fill="x", padx=10, pady=(0, 4))
         self.log_var = tk.StringVar(value="Llest.")
-        ttk.Label(frm_log, textvariable=self.log_var, foreground="#444").pack(anchor="w")
+        ttk.Label(col_esquerra, textvariable=self.log_var, foreground="#444",
+                  wraplength=280, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+
+        ttk.Separator(col_esquerra, orient="horizontal").pack(fill="x", padx=8, pady=4)
 
         # -- Extractor de vista plana --
-        frm_vista = ttk.LabelFrame(
-            self, text="Extreu vista plana (des del panorama descarregat — s'actualitza en moure els controls)")
-        frm_vista.pack(fill="both", expand=True, padx=10, pady=(6, 10))
-        frm_vista.columnconfigure(1, weight=1)
+        frm_vista = ttk.LabelFrame(col_esquerra, text="Vista plana (s'actualitza en moure)")
+        frm_vista.pack(fill="x", **pad)
+        frm_vista.columnconfigure(0, weight=1)
 
-        self._crea_slider(frm_vista, "Heading (0-360°, orientació):", self.heading_var, 0, 360, 0)
-        self._crea_slider(frm_vista, "Pitch (-90 a 90°, inclinació):", self.pitch_var, -90, 90, 1)
-        self._crea_slider(frm_vista, "FOV (30-120°, camp de visió):", self.fov_var, 30, 120, 2)
+        self._crea_slider(frm_vista, "Heading (0-360°):", self.heading_var, 0, 360, 0)
+        self._crea_slider(frm_vista, "Pitch (-90 a 90°):", self.pitch_var, -90, 90, 1)
+        self._crea_slider(frm_vista, "FOV (30-120°):", self.fov_var, 30, 120, 2)
 
         frm_btn_vista = ttk.Frame(frm_vista)
-        frm_btn_vista.grid(row=3, column=0, columnspan=3, pady=8)
+        frm_btn_vista.grid(row=6, column=0, columnspan=2, pady=8, sticky="ew")
         self.btn_extreu = ttk.Button(frm_btn_vista, text="Actualitza vista",
                                       command=lambda: self._extreu_vista(auto=False), state="disabled")
-        self.btn_extreu.pack(side="left", padx=4)
+        self.btn_extreu.pack(fill="x", pady=(0, 4))
         self.btn_desa_vista = ttk.Button(frm_btn_vista, text="Desa vista com a...",
                                           command=self._desa_vista, state="disabled")
-        self.btn_desa_vista.pack(side="left", padx=4)
+        self.btn_desa_vista.pack(fill="x")
 
-        self.lbl_vista = ttk.Label(frm_vista, text="(encara no hi ha vista extreta)", anchor="center")
-        self.lbl_vista.grid(row=4, column=0, columnspan=3, sticky="nsew", padx=8, pady=8)
-        frm_vista.rowconfigure(4, weight=1)
+        # ===================== COLUMNA DRETA: imatges =====================
+        # PanedWindow vertical: separació arrossegable entre les dues imatges.
+
+        paned_dreta = ttk.PanedWindow(col_dreta, orient="vertical")
+        paned_dreta.pack(fill="both", expand=True)
+
+        frm_preview = ttk.LabelFrame(paned_dreta, text="Previsualització del panorama")
+        self.lbl_preview = ttk.Label(frm_preview, text="(encara no hi ha imatge)", anchor="center")
+        self.lbl_preview.pack(fill="both", expand=True, padx=8, pady=8)
+        self.lbl_preview.bind("<Configure>", self._on_preview_configure)
+        paned_dreta.add(frm_preview, weight=1)
+
+        frm_vista_img = ttk.LabelFrame(paned_dreta, text="Vista plana extreta")
+        self.lbl_vista = ttk.Label(frm_vista_img, text="(encara no hi ha vista extreta)", anchor="center")
+        self.lbl_vista.pack(fill="both", expand=True, padx=8, pady=8)
+        self.lbl_vista.bind("<Configure>", self._on_vista_configure)
+        paned_dreta.add(frm_vista_img, weight=1)
+
+        # Reparteix l'espai vertical a mitges un cop la finestra té la mida real
+        # (evita que una de les dues quedi esquitxada al primer dibuixat).
+        def _centra_sash_dreta():
+            paned_dreta.update_idletasks()
+            alt = paned_dreta.winfo_height()
+            if alt > 20:
+                paned_dreta.sashpos(0, alt // 2)
+        self.after_idle(_centra_sash_dreta)
 
     def _crea_slider(self, parent, etiqueta, var, mín, màx, fila):
-        ttk.Label(parent, text=etiqueta, width=28, anchor="w").grid(
-            row=fila, column=0, sticky="w", padx=8, pady=4)
+        fila_label = fila * 2
+        fila_escala = fila_label + 1
+        ttk.Label(parent, text=etiqueta, anchor="w").grid(
+            row=fila_label, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 0))
         escala = ttk.Scale(parent, from_=mín, to=màx, variable=var, orient="horizontal",
                             command=lambda v: self._on_slider_change())
-        escala.grid(row=fila, column=1, sticky="ew", padx=8)
-        valor_lbl = ttk.Label(parent, width=6)
-        valor_lbl.grid(row=fila, column=2, sticky="w", padx=(0, 8))
+        escala.grid(row=fila_escala, column=0, sticky="ew", padx=8)
+        valor_lbl = ttk.Label(parent, width=5)
+        valor_lbl.grid(row=fila_escala, column=1, sticky="w", padx=(0, 8))
 
         def actualitza(*_):
             valor_lbl.config(text=f"{var.get():.0f}")
@@ -345,6 +394,31 @@ class PanoApp(tk.Tk):
             pass
 
     # -- flux principal: geocodifica -> preview zoom 0 -> descàrrega definitiva --
+
+    def _carrega_imatge(self):
+        """Carrega un panorama ja descarregat prèviament (p. ex. pel userscript del navegador)."""
+        ruta = filedialog.askopenfilename(
+            initialdir=self.carpeta_var.get(),
+            title="Selecciona una imatge de panorama",
+            filetypes=[
+                ("Imatges", "*.jpg *.jpeg *.png *.webp"),
+                ("Tots els fitxers", "*.*"),
+            ],
+        )
+        if not ruta:
+            return
+        try:
+            img = Image.open(ruta).convert("RGB")
+        except Exception as e:
+            messagebox.showerror("Error carregant la imatge", str(e))
+            return
+
+        self.panorama_complet = img
+        # Deduïm un panoid "fictici" a partir del nom de fitxer, només per als noms de sortida
+        self.pano_id = os.path.splitext(os.path.basename(ruta))[0]
+        self._mostra_preview(img, f"carregada des de {os.path.basename(ruta)}")
+        self._log(f"Imatge carregada: {os.path.basename(ruta)} ({img.width}×{img.height})")
+        self.btn_extreu.config(state="normal")
 
     def _iniciar_descarrega(self):
         adreca = self.adreca_var.get().strip()
@@ -479,6 +553,7 @@ class PanoApp(tk.Tk):
             self.pano_id = pano_id
             preview = descarrega_panorama(pano_id, zoom=0)
             self.panorama_complet = preview  # de moment, la previsualització fa de "complet"
+            self._resolucio_definitiva = False
             self.after(0, lambda: self._mostra_preview(preview, "previsualització ràpida (zoom 0)"))
             self._log("Previsualització llesta. Si és el punt correcte, prem "
                        "«Descarrega resolució desitjada».")
@@ -522,6 +597,7 @@ class PanoApp(tk.Tk):
                 panorama_final = self.panorama_complet
 
             self.panorama_complet = panorama_final
+            self._resolucio_definitiva = True
             nom_fitxer = f"panorama_{pano_id}_z{zoom}.jpg"
             out_path = os.path.join(self.carpeta_var.get(), nom_fitxer)
             panorama_final.save(out_path, quality=95)
@@ -537,13 +613,30 @@ class PanoApp(tk.Tk):
             self.after(0, lambda: self.btn_extreu.config(state="normal"))
 
     def _mostra_preview(self, panorama_img, etiqueta=""):
-        mida_preview = (600, 260)
-        copia = panorama_img.copy()
-        copia.thumbnail(mida_preview)
-        self.preview_img = ImageTk.PhotoImage(copia)
-        self.lbl_preview.config(image=self.preview_img, text="")
+        self._preview_source = panorama_img
+        self._redibuixa_preview()
         if etiqueta:
             self._log(f"Previsualització actualitzada ({etiqueta}).")
+
+    def _redibuixa_preview(self):
+        """Reescala la imatge original a la mida real disponible del requadre.
+        Es crida en mostrar-la per primer cop i cada vegada que l'espai canvia
+        de mida (redimensionar finestra o arrossegar la separació)."""
+        if self._preview_source is None:
+            return
+        w = self.lbl_preview.winfo_width()
+        h = self.lbl_preview.winfo_height()
+        if w < 20 or h < 20:
+            return  # encara no hi ha una mida real assignada al widget
+        copia = self._preview_source.copy()
+        copia.thumbnail((max(w - 4, 10), max(h - 4, 10)))
+        self.preview_img = ImageTk.PhotoImage(copia)
+        self.lbl_preview.config(image=self.preview_img, text="")
+
+    def _on_preview_configure(self, event):
+        if self._debounce_preview_id:
+            self.after_cancel(self._debounce_preview_id)
+        self._debounce_preview_id = self.after(150, self._redibuixa_preview)
 
     # -- extracció de vista plana ---------------------------------------------
 
@@ -561,6 +654,16 @@ class PanoApp(tk.Tk):
             return
         if self._extracting:
             return  # ja n'hi ha una en curs; la propera pujada de lliscador ja la reprogramarà
+
+        # En mode manual (l'usuari ha premut "Actualitza vista"), si encara no tenim
+        # la resolució definitiva descarregada, la baixem primer automàticament
+        # perquè la vista extreta surti amb la millor qualitat, no la de la
+        # previsualització ràpida (zoom 0).
+        if not auto and not self._resolucio_definitiva and self.pano_id:
+            self._log("Baixant primer la resolució definitiva per a una millor qualitat...")
+            self.btn_extreu.config(state="disabled")
+            threading.Thread(target=self._baixa_definitiva_i_extreu, daemon=True).start()
+            return
 
         heading = self.heading_var.get()
         pitch = self.pitch_var.get()
@@ -589,12 +692,62 @@ class PanoApp(tk.Tk):
 
         threading.Thread(target=feina, daemon=True).start()
 
+    def _baixa_definitiva_i_extreu(self):
+        """Baixa la resolució definitiva (mateix codi que el botó dedicat) i,
+        un cop llesta, extreu la vista plana automàticament."""
+        try:
+            pano_id = self.pano_id
+            zoom = self.zoom_var.get()
+            cols = 2 ** zoom
+            rows = 2 ** (zoom - 1) if zoom > 0 else 1
+            self.after(0, lambda: self.progress.config(maximum=cols * rows, value=0))
+
+            if zoom > 0:
+                def progress_cb(fet, total):
+                    self.after(0, lambda: self.progress.config(value=fet))
+                    self.after(0, lambda: self.log_var.set(f"Descarregant tessel·les... {fet}/{total}"))
+
+                panorama_final = descarrega_panorama(pano_id, zoom, progress_cb)
+            else:
+                panorama_final = self.panorama_complet
+
+            self.panorama_complet = panorama_final
+            self._resolucio_definitiva = True
+            nom_fitxer = f"panorama_{pano_id}_z{zoom}.jpg"
+            out_path = os.path.join(self.carpeta_var.get(), nom_fitxer)
+            panorama_final.save(out_path, quality=95)
+            self.after(0, lambda: self._mostra_preview(panorama_final, "panorama definitiu"))
+            self._log(f"Resolució definitiva llesta ({out_path}). Extraient vista...")
+
+        except Exception as e:
+            self._log(f"Error baixant la resolució definitiva: {e}")
+            self.after(0, lambda: messagebox.showerror("Error", str(e)))
+            self.after(0, lambda: self.btn_extreu.config(state="normal"))
+            return
+
+        # Ara sí, extreu la vista amb la imatge d'alta resolució ja disponible.
+        self.after(0, lambda: self._extreu_vista(auto=False))
+
     def _mostra_vista(self, vista_img):
-        mida_preview = (600, 340)
-        copia = vista_img.copy()
-        copia.thumbnail(mida_preview)
+        self._vista_source = vista_img
+        self._redibuixa_vista()
+
+    def _redibuixa_vista(self):
+        if self._vista_source is None:
+            return
+        w = self.lbl_vista.winfo_width()
+        h = self.lbl_vista.winfo_height()
+        if w < 20 or h < 20:
+            return
+        copia = self._vista_source.copy()
+        copia.thumbnail((max(w - 4, 10), max(h - 4, 10)))
         self.vista_img = ImageTk.PhotoImage(copia)
         self.lbl_vista.config(image=self.vista_img, text="")
+
+    def _on_vista_configure(self, event):
+        if self._debounce_vista_resize_id:
+            self.after_cancel(self._debounce_vista_resize_id)
+        self._debounce_vista_resize_id = self.after(150, self._redibuixa_vista)
 
     def _desa_vista(self):
         if self.vista_extreta is None:
